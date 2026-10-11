@@ -15,8 +15,8 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-//! Range and term queries with bounds or values at or beyond the edges of an integer field's
-//! range return the same rows as the equivalent plain SQL.
+//! Queries on integer and integer range fields with bounds or values at or beyond the edges of
+//! the integer types return the same rows as the equivalent plain SQL.
 //! Timestamps are stored as i64, with '-infinity' and 'infinity' at the edges.
 
 use pretty_assertions::assert_eq;
@@ -251,5 +251,107 @@ fn segment_pruning_with_a_term_beyond_the_maximum(mut conn: PgConnection) {
             "NOT x = 18000000000000000000",
             2,
         )],
+    );
+}
+
+#[rstest]
+fn int_range_fields(mut conn: PgConnection) {
+    // The plain copy holds the ranges as numrange, which can contain values beyond bigint.
+    r#"
+    CREATE TABLE ranges (id SERIAL PRIMARY KEY, r8 INT8RANGE, r4 INT4RANGE);
+    INSERT INTO ranges (r8, r4) VALUES
+        ('[1,10)', '[1,10)'),
+        ('[0,5)', '[0,5)'),
+        ('[5,)', '[5,)'),
+        ('(,5)', '(,5)'),
+        ('(,)', '(,)'),
+        ('empty', 'empty'),
+        (NULL, NULL),
+        ('[-9223372036854775808,0)', '[-2147483648,0)'),
+        ('[1,9223372036854775807)', '[1,2147483647)'),
+        ('[9223372036854775807,)', '[2147483647,)');
+    CREATE INDEX ranges_idx ON ranges USING paradedb (id, r8, r4);
+    CREATE TABLE ranges_plain AS
+    SELECT id, r8::text::numrange AS r8, r4::text::numrange AS r4 FROM ranges;
+    "#
+    .execute(&mut conn);
+
+    assert_same_rows(
+        &mut conn,
+        "ranges",
+        &[
+            // Values at and beyond the edges of bigint.
+            (
+                r#"id @@@ '{"range_term":{"field":"r8","value":18000000000000000000}}'::jsonb"#,
+                "r8 @> 18000000000000000000::numeric",
+                3,
+            ),
+            (
+                r#"id @@@ '{"range_term":{"field":"r8","value":-10000000000000000000}}'::jsonb"#,
+                "r8 @> -10000000000000000000::numeric",
+                2,
+            ),
+            (
+                "r8 @@@ pdb.range_term(18000000000000000000::numeric)",
+                "r8 @> 18000000000000000000::numeric",
+                3,
+            ),
+            (
+                "r8 @@@ pdb.range_term(-9223372036854775809::numeric)",
+                "r8 @> -9223372036854775809::numeric",
+                2,
+            ),
+            (
+                r#"id @@@ '{"range_term":{"field":"r8","value":9223372036854775807}}'::jsonb"#,
+                "r8 @> 9223372036854775807::numeric",
+                3,
+            ),
+            (
+                r#"id @@@ '{"range_term":{"field":"r8","value":-9223372036854775808}}'::jsonb"#,
+                "r8 @> -9223372036854775808::numeric",
+                3,
+            ),
+            (
+                "r4 @@@ pdb.range_term(18000000000000000000::numeric)",
+                "r4 @> 18000000000000000000::numeric",
+                3,
+            ),
+            (
+                r#"id @@@ '{"range_term":{"field":"r4","value":-10000000000000000000}}'::jsonb"#,
+                "r4 @> -10000000000000000000::numeric",
+                2,
+            ),
+            // JSON range bounds beyond the edges of bigint.
+            (
+                r#"id @@@ '{"range_intersects":{"field":"r8","lower_bound":{"included":18000000000000000000},"upper_bound":null}}'::jsonb"#,
+                "r8 && numrange(18000000000000000000, NULL)",
+                3,
+            ),
+            (
+                r#"id @@@ '{"range_intersects":{"field":"r8","lower_bound":null,"upper_bound":{"included":-10000000000000000000}}}'::jsonb"#,
+                "r8 && numrange(NULL, -10000000000000000000, '[]')",
+                2,
+            ),
+            (
+                r#"id @@@ '{"range_contains":{"field":"r8","lower_bound":{"included":-10000000000000000000},"upper_bound":{"included":18000000000000000000}}}'::jsonb"#,
+                "numrange(-10000000000000000000, 18000000000000000000, '[]') @> r8",
+                5,
+            ),
+            (
+                r#"id @@@ '{"range_contains":{"field":"r8","lower_bound":{"included":18000000000000000000},"upper_bound":null}}'::jsonb"#,
+                "numrange(18000000000000000000, NULL) @> r8",
+                1,
+            ),
+            (
+                r#"id @@@ '{"range_within":{"field":"r8","lower_bound":{"included":-10000000000000000000},"upper_bound":{"included":-5}}}'::jsonb"#,
+                "r8 @> numrange(-10000000000000000000, -5, '[]')",
+                2,
+            ),
+            (
+                r#"id @@@ '{"range_within":{"field":"r8","lower_bound":{"included":5},"upper_bound":{"included":20000000000000000000}}}'::jsonb"#,
+                "r8 @> numrange(5, 20000000000000000000, '[]')",
+                2,
+            ),
+        ],
     );
 }

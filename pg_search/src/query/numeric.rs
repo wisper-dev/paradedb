@@ -437,7 +437,8 @@ pub fn numeric_bound_to_bytes(
 /// Convert a value for range field queries based on the range element type.
 ///
 /// Range fields are indexed with specific element types:
-/// - INT4RANGEOID, INT8RANGEOID: indexed as i32/i64 → convert to I64
+/// - INT4RANGEOID, INT8RANGEOID: indexed as i32/i64 → convert to I64, or to an infinity if the
+///   value lies beyond the i64 range
 /// - NUMRANGEOID: indexed as hex-encoded sortable bytes → convert to hex string
 /// - Date/time ranges: use datetime conversion (handled elsewhere)
 ///
@@ -458,23 +459,32 @@ pub fn convert_value_for_range_field(
     // Convert based on the range's element type
     match oid.try_into() {
         Ok(BuiltinOid::INT4RANGEOID) | Ok(BuiltinOid::INT8RANGEOID) => {
-            // Integer ranges: convert directly to i64
-            match &value {
-                PdbOwnedValue::I64(i) => PdbOwnedValue::I64(*i),
-                PdbOwnedValue::U64(u) => PdbOwnedValue::I64(*u as i64),
-                PdbOwnedValue::F64(f) => PdbOwnedValue::I64(*f as i64),
-                PdbOwnedValue::Str(s) => {
-                    // Try parsing as i64 first to preserve precision
-                    if let Ok(i) = s.parse::<i64>() {
-                        return PdbOwnedValue::I64(i);
-                    }
-                    // Fallback: try parsing as f64 for decimal values
-                    if let Ok(f) = s.parse::<f64>() {
-                        return PdbOwnedValue::I64(f as i64);
-                    }
-                    value
-                }
-                _ => value,
+            // A value beyond the i64 range becomes an infinity, which `RangeField` compares as
+            // lying beyond every stored bound.
+            let infinity = |negative| {
+                PdbOwnedValue::F64(if negative {
+                    f64::NEG_INFINITY
+                } else {
+                    f64::INFINITY
+                })
+            };
+            if let Some(n) = exact_integer(&value) {
+                return i64::try_from(n).map_or_else(|_| infinity(n < 0), PdbOwnedValue::I64);
+            }
+            let float = match &value {
+                PdbOwnedValue::F64(f) => *f,
+                PdbOwnedValue::Str(s) => match s.trim().parse::<f64>() {
+                    Ok(f) => f,
+                    Err(_) => return value,
+                },
+                _ => return value,
+            };
+            // NaN, which Postgres orders above every number, becomes positive infinity.
+            let truncated = float.trunc();
+            if (i64::MIN as f64..-(i64::MIN as f64)).contains(&truncated) {
+                PdbOwnedValue::I64(truncated as i64)
+            } else {
+                infinity(truncated < 0.0)
             }
         }
         Ok(BuiltinOid::NUMRANGEOID) => {
@@ -648,6 +658,10 @@ mod tests {
         PdbOwnedValue::Str(s.to_string())
     }
 
+    fn float(f: f64) -> PdbOwnedValue {
+        PdbOwnedValue::F64(f)
+    }
+
     const INT8: SearchFieldType = SearchFieldType::I64(pgrx::pg_sys::INT8OID);
     const OID: SearchFieldType = SearchFieldType::U64(pgrx::pg_sys::OIDOID);
     const HUGE: &str = "100000000000000000000000000000000000000000";
@@ -723,5 +737,26 @@ mod tests {
         #[case] expected: bool,
     ) {
         assert_eq!(is_outside_int_domain(&value, &field_type), expected);
+    }
+
+    #[rstest]
+    #[case::integer(int(5), int(5))]
+    #[case::u64_at_max(uint(i64::MAX as u64), int(i64::MAX))]
+    #[case::u64_above_max(uint(1 << 63), float(f64::INFINITY))]
+    #[case::below_min(text("-9223372036854775809"), float(f64::NEG_INFINITY))]
+    #[case::beyond_i128(text(HUGE), float(f64::INFINITY))]
+    #[case::fraction(text("2.5"), int(2))]
+    #[case::float_below_min(float(-1e19), float(f64::NEG_INFINITY))]
+    #[case::nan(text("NaN"), float(f64::INFINITY))]
+    #[case::not_a_number(text("abc"), text("abc"))]
+    fn test_convert_value_for_int_range_field(
+        #[case] value: PdbOwnedValue,
+        #[case] expected: PdbOwnedValue,
+    ) {
+        let int8range = SearchFieldType::Range(pgrx::pg_sys::INT8RANGEOID);
+        assert_eq!(
+            convert_value_for_range_field(value, &int8range, None),
+            expected
+        );
     }
 }

@@ -115,6 +115,7 @@ impl RangeField {
         comparison: Comparison,
         index_created_by_version: Option<Version>,
     ) -> Result<RangeQuery> {
+        let (owned, comparison) = clamp_to_i64(owned, comparison);
         let query = match comparison {
             Comparison::LessThan => RangeQuery::new(
                 Bound::Excluded(Self::as_range_term(
@@ -163,6 +164,7 @@ impl RangeField {
         comparison: Comparison,
         index_created_by_version: Option<Version>,
     ) -> Result<RangeQuery> {
+        let (owned, comparison) = clamp_to_i64(owned, comparison);
         let query = match comparison {
             Comparison::LessThan => RangeQuery::new(
                 Bound::Excluded(Self::as_range_term(
@@ -218,6 +220,31 @@ impl RangeField {
             EXPAND_DOTS,
             index_created_by_version,
         )
+    }
+}
+
+/// Range fields store every number as an `i64`. A number beyond the `i64` range lies above or
+/// below every stored bound, so it compares with each bound like the nearest `i64` under a strict
+/// or a non-strict comparison.
+fn clamp_to_i64(value: &PdbOwnedValue, comparison: Comparison) -> (&PdbOwnedValue, Comparison) {
+    use Comparison::*;
+    static MIN: PdbOwnedValue = PdbOwnedValue::I64(i64::MIN);
+    static MAX: PdbOwnedValue = PdbOwnedValue::I64(i64::MAX);
+
+    let above = match *value {
+        PdbOwnedValue::U64(n) if n > i64::MAX as u64 => true,
+        PdbOwnedValue::F64(f) if f >= -(i64::MIN as f64) => true,
+        PdbOwnedValue::F64(f) if f < i64::MIN as f64 => false,
+        _ => return (value, comparison),
+    };
+    // A value above every stored bound is greater than each of them, as `i64::MAX` is under
+    // `GreaterThanOrEqual`, and less than none, as `i64::MAX` is under `LessThan`. A value below
+    // every stored bound is the mirror image, with `i64::MIN`.
+    match (above, comparison) {
+        (true, LessThan | LessThanOrEqual) => (&MAX, LessThan),
+        (true, GreaterThan | GreaterThanOrEqual) => (&MAX, GreaterThanOrEqual),
+        (false, LessThan | LessThanOrEqual) => (&MIN, LessThanOrEqual),
+        (false, GreaterThan | GreaterThanOrEqual) => (&MIN, GreaterThan),
     }
 }
 
@@ -307,4 +334,36 @@ enum CapitalizedBoundDef<T> {
     Included { Included: T },
     Excluded { Excluded: T },
     Unbounded,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use Comparison::*;
+    use PdbOwnedValue::{F64, I64, U64};
+    use rstest::rstest;
+
+    #[rstest]
+    #[case::u64_above(U64(1 << 63), LessThanOrEqual, i64::MAX, LessThan)]
+    #[case::f64_above(F64(-(i64::MIN as f64)), GreaterThan, i64::MAX, GreaterThanOrEqual)]
+    #[case::infinity(F64(f64::INFINITY), LessThan, i64::MAX, LessThan)]
+    #[case::f64_below(F64(-1e19), LessThan, i64::MIN, LessThanOrEqual)]
+    #[case::negative_infinity(F64(f64::NEG_INFINITY), GreaterThanOrEqual, i64::MIN, GreaterThan)]
+    fn test_clamp_to_i64_beyond(
+        #[case] value: PdbOwnedValue,
+        #[case] comparison: Comparison,
+        #[case] edge: i64,
+        #[case] expected: Comparison,
+    ) {
+        assert_eq!(clamp_to_i64(&value, comparison), (&I64(edge), expected));
+    }
+
+    #[rstest]
+    #[case::u64_at_max(U64(i64::MAX as u64))]
+    #[case::f64_at_min(F64(i64::MIN as f64))]
+    #[case::i64(I64(5))]
+    #[case::string(PdbOwnedValue::Str("18000000000000000000".into()))]
+    fn test_clamp_to_i64_inside(#[case] value: PdbOwnedValue) {
+        assert_eq!(clamp_to_i64(&value, LessThan), (&value, LessThan));
+    }
 }

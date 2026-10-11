@@ -1130,7 +1130,7 @@ fn range_term(
 
     // Convert numeric values to appropriate types based on range field type.
     // Range fields are indexed as JSON with specific element types:
-    // - INT4RANGEOID, INT8RANGEOID: indexed as i32/i64 → convert to I64
+    // - INT4RANGEOID, INT8RANGEOID: indexed as i32/i64 → convert to I64 (or an infinity beyond i64)
     // - NUMRANGEOID: indexed as hex-encoded sortable bytes (see SortableDecimal) → convert to hex string
     // - Date/time ranges: handling is determined by examining the schema
     let value = convert_value_for_range_field(
